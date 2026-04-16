@@ -16,6 +16,7 @@ import sys
 import time
 import json
 import datetime
+from contextlib import asynccontextmanager
 
 try:
     import httpx
@@ -523,6 +524,13 @@ if __name__ == "__main__":
     # Get the MCP ASGI app
     mcp_app = mcp.streamable_http_app()
 
+mcp_app = mcp.streamable_http_app()
+
+    @asynccontextmanager
+    async def lifespan(app):
+        async with mcp.session_manager.run():
+            yield
+
     # Build composite app: auth routes + JWT-protected MCP
     app = Starlette(
         routes=[
@@ -534,6 +542,6 @@ if __name__ == "__main__":
         middleware=[
             Middleware(JWTAuthMiddleware),
         ],
+        lifespan=lifespan,
     )
-
     uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
