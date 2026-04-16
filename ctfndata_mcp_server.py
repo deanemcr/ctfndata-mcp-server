@@ -524,8 +524,6 @@ if __name__ == "__main__":
     # Get the MCP ASGI app
     mcp_app = mcp.streamable_http_app()
 
-mcp_app = mcp.streamable_http_app()
-
     @asynccontextmanager
     async def lifespan(app):
         async with mcp.session_manager.run():
