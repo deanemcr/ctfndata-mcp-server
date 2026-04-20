@@ -104,10 +104,18 @@ async def protected_resource_metadata(request: Request) -> JSONResponse:
 
     Advertises which Authorization Server can mint tokens for this resource.
     Claude Desktop fetches this after getting a 401 with WWW-Authenticate.
+
+    Served at BOTH /.well-known/oauth-protected-resource (root form) and
+    /.well-known/oauth-protected-resource/mcp (path-aware form per RFC 9728
+    §3.1, which is what recent MCP clients actually request).
+
+    AUTH0_ISSUER is served WITH its trailing slash to exactly match Auth0's
+    OpenID Configuration `issuer` field — any mismatch here causes compliant
+    OAuth clients to reject the metadata.
     """
     return JSONResponse({
         "resource": AUTH0_AUDIENCE,
-        "authorization_servers": [AUTH0_ISSUER.rstrip("/")],
+        "authorization_servers": [AUTH0_ISSUER],
         "bearer_methods_supported": ["header"],
         "scopes_supported": ["openid", "profile", "email", "offline_access"],
     })
@@ -353,8 +361,16 @@ if __name__ == "__main__":
 
     app = Starlette(
         routes=[
+            # Root-form metadata (legacy MCP clients + RFC 9728 fallback)
             Route(
                 "/.well-known/oauth-protected-resource",
+                protected_resource_metadata,
+                methods=["GET"],
+            ),
+            # Path-aware metadata (RFC 9728 §3.1 — what current MCP clients
+            # actually fetch when the protected resource is /mcp)
+            Route(
+                "/.well-known/oauth-protected-resource/mcp",
                 protected_resource_metadata,
                 methods=["GET"],
             ),
