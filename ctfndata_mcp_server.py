@@ -1,21 +1,16 @@
 #!/usr/bin/env python3
 """
-CTFN Data MCP Server — exposes CTFNDATA risk-metrics API as MCP tools.
+CTFN Data MCP Server — OAuth 2.1 Resource Server.
 
-Wraps the REST API at ctfndata.onrender.com so Claude can query
-M&A break prices, spreads, odds, and risk/reward metrics directly.
+Wraps the CTFNDATA risk-metrics API as MCP tools. Authentication is delegated
+to Auth0 as an OAuth 2.1 Authorization Server (with Dynamic Client Registration
+and PKCE). This process validates Auth0-issued RS256 JWTs via JWKS.
 
-Includes JWT authentication with PostgreSQL user storage.
-Users log in once per month and include the token in the MCP URL.
-
-Runs as a streamable-HTTP MCP server (for Railway remote deployment).
+Runs as a streamable-HTTP MCP server on Railway.
 """
-
 import os
 import sys
 import time
-import json
-import datetime
 from contextlib import asynccontextmanager
 
 try:
@@ -27,20 +22,7 @@ except ImportError:
 try:
     import jwt as pyjwt
 except ImportError:
-    print("ERROR: PyJWT not installed. Run: pip install PyJWT", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    import bcrypt
-except ImportError:
-    print("ERROR: bcrypt not installed. Run: pip install bcrypt", file=sys.stderr)
-    sys.exit(1)
-
-try:
-    import psycopg2
-    import psycopg2.extras
-except ImportError:
-    print("ERROR: psycopg2 not installed. Run: pip install psycopg2-binary", file=sys.stderr)
+    print("ERROR: PyJWT[crypto] not installed. Run: pip install 'PyJWT[crypto]'", file=sys.stderr)
     sys.exit(1)
 
 from starlette.applications import Starlette
@@ -56,274 +38,129 @@ from mcp.server.transport_security import TransportSecuritySettings
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
-
+# Upstream CTFNDATA REST API
 API_BASE = os.environ.get("CTFNDATA_API_BASE", "https://ctfndata.onrender.com")
 API_USER = os.environ.get("CTFNDATA_USER", "deanemcrobie@gmail.com")
-API_PASS = os.environ.get("CTFNDATA_PASS", "Mambopoa1!")
+API_PASS = os.environ.get("CTFNDATA_PASS", "")
 
-DATABASE_URL = os.environ.get("DATABASE_URL", "")
-JWT_SECRET = os.environ.get("JWT_SECRET", "change-me-in-production")
-JWT_EXPIRY_DAYS = int(os.environ.get("JWT_EXPIRY_DAYS", "30"))
+# Auth0 as Authorization Server
+AUTH0_DOMAIN = os.environ["AUTH0_DOMAIN"]  # e.g. dev-co8yw00rdyijudwk.us.auth0.com
+AUTH0_AUDIENCE = os.environ["AUTH0_AUDIENCE"]  # must match the API Identifier in Auth0
+AUTH0_ISSUER = f"https://{AUTH0_DOMAIN}/"
+AUTH0_JWKS_URL = f"https://{AUTH0_DOMAIN}/.well-known/jwks.json"
 
-# ---------------------------------------------------------------------------
-# Database helpers
-# ---------------------------------------------------------------------------
-
-
-def _get_db():
-    """Get a PostgreSQL connection."""
-    if not DATABASE_URL:
-        raise RuntimeError("DATABASE_URL not configured")
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.autocommit = True
-    return conn
-
-
-def _init_db():
-    """Create the users table if it doesn't exist."""
-    try:
-        conn = _get_db()
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS users (
-                    id SERIAL PRIMARY KEY,
-                    username VARCHAR(255) UNIQUE NOT NULL,
-                    password_hash VARCHAR(255) NOT NULL,
-                    is_admin BOOLEAN DEFAULT FALSE,
-                    created_at TIMESTAMP DEFAULT NOW(),
-                    last_login TIMESTAMP
-                )
-            """)
-        conn.close()
-        print("Database initialized (users table ready)", file=sys.stderr)
-    except Exception as e:
-        print(f"WARNING: Database init failed: {e}", file=sys.stderr)
-        print("Server will start but auth features won't work without DATABASE_URL", file=sys.stderr)
-
-
-def _verify_user(username: str, password: str) -> dict | None:
-    """Verify username/password against the database. Returns user dict or None."""
-    conn = _get_db()
-    with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-        cur.execute("SELECT id, username, password_hash, is_admin FROM users WHERE username = %s", (username,))
-        row = cur.fetchone()
-        if row and bcrypt.checkpw(password.encode("utf-8"), row["password_hash"].encode("utf-8")):
-            # Update last_login
-            cur.execute("UPDATE users SET last_login = NOW() WHERE id = %s", (row["id"],))
-            conn.close()
-            return {"id": row["id"], "username": row["username"], "is_admin": row["is_admin"]}
-    conn.close()
-    return None
-
-
-def _create_user(username: str, password: str, is_admin: bool = False) -> dict:
-    """Create a new user. Returns the user dict."""
-    password_hash = bcrypt.hashpw(password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
-    conn = _get_db()
-    with conn.cursor() as cur:
-        cur.execute(
-            "INSERT INTO users (username, password_hash, is_admin) VALUES (%s, %s, %s) RETURNING id",
-            (username, password_hash, is_admin),
-        )
-        user_id = cur.fetchone()[0]
-    conn.close()
-    return {"id": user_id, "username": username, "is_admin": is_admin}
-
+# This server's public URL (used in Protected Resource Metadata and
+# WWW-Authenticate resource_metadata hints)
+SERVER_URL = os.environ.get(
+    "SERVER_URL",
+    "https://ctfndata-mcp-server-production.up.railway.app",
+).rstrip("/")
 
 # ---------------------------------------------------------------------------
-# JWT helpers
+# JWKS-backed JWT validator (PyJWT caches keys automatically)
 # ---------------------------------------------------------------------------
-
-
-def _create_jwt(user: dict) -> str:
-    """Create a JWT token for a user, valid for JWT_EXPIRY_DAYS."""
-    payload = {
-        "sub": user["username"],
-        "uid": user["id"],
-        "admin": user.get("is_admin", False),
-        "iat": datetime.datetime.now(datetime.timezone.utc),
-        "exp": datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=JWT_EXPIRY_DAYS),
-    }
-    return pyjwt.encode(payload, JWT_SECRET, algorithm="HS256")
+_jwks_client = pyjwt.PyJWKClient(AUTH0_JWKS_URL, cache_keys=True)
 
 
 def _verify_jwt(token: str) -> dict | None:
-    """Verify and decode a JWT token. Returns payload or None."""
+    """Validate an Auth0 RS256 JWT. Returns claims dict on success, None on failure."""
     try:
-        payload = pyjwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        return payload
-    except pyjwt.ExpiredSignatureError:
+        signing_key = _jwks_client.get_signing_key_from_jwt(token)
+        claims = pyjwt.decode(
+            token,
+            signing_key.key,
+            algorithms=["RS256"],
+            audience=AUTH0_AUDIENCE,
+            issuer=AUTH0_ISSUER,
+        )
+        return claims
+    except Exception as e:
+        print(f"JWT validation failed: {e}", file=sys.stderr)
         return None
-    except pyjwt.InvalidTokenError:
-        return None
 
 
-# ---------------------------------------------------------------------------
-# Auth endpoints (Starlette routes)
-# ---------------------------------------------------------------------------
-
-
-async def login_endpoint(request: Request) -> JSONResponse:
-    """POST /auth/login — authenticate and receive a JWT token."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
-
-    if not username or not password:
-        return JSONResponse({"error": "username and password required"}, status_code=400)
-
-    try:
-        user = _verify_user(username, password)
-    except Exception as e:
-        return JSONResponse({"error": f"Database error: {e}"}, status_code=500)
-
-    if not user:
-        return JSONResponse({"error": "Invalid credentials"}, status_code=401)
-
-    token = _create_jwt(user)
-    return JSONResponse({
-        "access_token": token,
-        "token_type": "bearer",
-        "expires_in_days": JWT_EXPIRY_DAYS,
-        "username": user["username"],
-        "message": (
-            f"Token valid for {JWT_EXPIRY_DAYS} days. "
-            "Add to your MCP connector URL as: "
-            "https://YOUR-HOST/mcp?token=YOUR_TOKEN"
-        ),
-    })
-
-
-async def register_endpoint(request: Request) -> JSONResponse:
-    """POST /auth/register — create a new user (admin-only, or first user is auto-admin)."""
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
-
-    username = body.get("username", "").strip()
-    password = body.get("password", "")
-    is_admin = body.get("is_admin", False)
-
-    if not username or not password:
-        return JSONResponse({"error": "username and password required"}, status_code=400)
-
-    if len(password) < 8:
-        return JSONResponse({"error": "Password must be at least 8 characters"}, status_code=400)
-
-    # Check if this is the first user (auto-promote to admin)
-    try:
-        conn = _get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users")
-            user_count = cur.fetchone()[0]
-        conn.close()
-    except Exception as e:
-        return JSONResponse({"error": f"Database error: {e}"}, status_code=500)
-
-    if user_count == 0:
-        # First user is always admin
-        is_admin = True
-    else:
-        # Require admin token for subsequent registrations
-        token = _extract_token(request)
-        if not token:
-            return JSONResponse({"error": "Admin token required to register new users"}, status_code=401)
-        payload = _verify_jwt(token)
-        if not payload or not payload.get("admin"):
-            return JSONResponse({"error": "Only admins can register new users"}, status_code=403)
-
-    try:
-        user = _create_user(username, password, is_admin)
-    except psycopg2.errors.UniqueViolation:
-        return JSONResponse({"error": f"Username '{username}' already exists"}, status_code=409)
-    except Exception as e:
-        return JSONResponse({"error": f"Database error: {e}"}, status_code=500)
-
-    token = _create_jwt(user)
-    return JSONResponse({
-        "message": f"User '{username}' created successfully",
-        "is_admin": is_admin,
-        "access_token": token,
-        "expires_in_days": JWT_EXPIRY_DAYS,
-    }, status_code=201)
-
-
-async def health_endpoint(request: Request) -> JSONResponse:
-    """GET /health — public health check."""
-    db_ok = False
-    try:
-        conn = _get_db()
-        with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) FROM users")
-            user_count = cur.fetchone()[0]
-        conn.close()
-        db_ok = True
-    except Exception:
-        user_count = -1
-
-    return JSONResponse({
-        "status": "ok",
-        "database": "connected" if db_ok else "unavailable",
-        "users": user_count,
-        "auth": "jwt",
-        "token_expiry_days": JWT_EXPIRY_DAYS,
-    })
-
-
-# ---------------------------------------------------------------------------
-# Auth middleware — protects /mcp routes
-# ---------------------------------------------------------------------------
-
-
-def _extract_token(request: Request) -> str | None:
-    """Extract JWT from query param or Authorization header."""
-    # 1. Check query parameter ?token=xxx
-    token = request.query_params.get("token")
-    if token:
-        return token
-
-    # 2. Check Authorization: Bearer xxx header
+def _extract_bearer(request: Request) -> str | None:
+    """Extract bearer token from the Authorization header."""
     auth_header = request.headers.get("authorization", "")
     if auth_header.lower().startswith("bearer "):
         return auth_header[7:].strip()
-
     return None
 
 
-class JWTAuthMiddleware(BaseHTTPMiddleware):
-    """Middleware that requires a valid JWT for /mcp requests."""
+def _www_authenticate(error: str | None = None) -> str:
+    """Build an RFC 6750 / MCP-compliant WWW-Authenticate header value."""
+    parts = [f'Bearer realm="CTFN Data MCP"']
+    if error:
+        parts.append(f'error="{error}"')
+    parts.append(f'resource_metadata="{SERVER_URL}/.well-known/oauth-protected-resource"')
+    return ", ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# OAuth discovery / health endpoints
+# ---------------------------------------------------------------------------
+async def protected_resource_metadata(request: Request) -> JSONResponse:
+    """RFC 9728 Protected Resource Metadata.
+
+    Advertises which Authorization Server can mint tokens for this resource.
+    Claude Desktop fetches this after getting a 401 with WWW-Authenticate.
+    """
+    return JSONResponse({
+        "resource": AUTH0_AUDIENCE,
+        "authorization_servers": [AUTH0_ISSUER.rstrip("/")],
+        "bearer_methods_supported": ["header"],
+        "scopes_supported": ["openid", "profile", "email", "offline_access"],
+    })
+
+
+async def health_endpoint(request: Request) -> JSONResponse:
+    """Public health check — no auth required."""
+    return JSONResponse({
+        "status": "ok",
+        "auth": "oauth2.1-auth0",
+        "authorization_server": AUTH0_ISSUER.rstrip("/"),
+        "audience": AUTH0_AUDIENCE,
+    })
+
+
+# ---------------------------------------------------------------------------
+# OAuth middleware — protects /mcp routes
+# ---------------------------------------------------------------------------
+class OAuthMiddleware(BaseHTTPMiddleware):
+    """Validates Auth0-issued bearer tokens on /mcp requests."""
 
     async def dispatch(self, request: Request, call_next):
-        # Only protect /mcp paths
-        if request.url.path.startswith("/mcp"):
-            token = _extract_token(request)
-            if not token:
-                return JSONResponse(
-                    {"error": "Authentication required. Get a token via POST /auth/login"},
-                    status_code=401,
-                )
-            payload = _verify_jwt(token)
-            if not payload:
-                return JSONResponse(
-                    {"error": "Token expired or invalid. Get a new token via POST /auth/login"},
-                    status_code=401,
-                )
-            # Attach user info to request state
-            request.state.user = payload
+        # Only protect /mcp; everything else passes through (health, discovery)
+        if not request.url.path.startswith("/mcp"):
+            return await call_next(request)
 
+        token = _extract_bearer(request)
+        if not token:
+            return JSONResponse(
+                {"error": "unauthorized", "error_description": "Bearer token required"},
+                status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate()},
+            )
+
+        claims = _verify_jwt(token)
+        if not claims:
+            return JSONResponse(
+                {
+                    "error": "invalid_token",
+                    "error_description": "Token invalid, expired, or audience/issuer mismatch",
+                },
+                status_code=401,
+                headers={"WWW-Authenticate": _www_authenticate(error="invalid_token")},
+            )
+
+        # Attach claims for tools/logging downstream
+        request.state.user = claims
         return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
-# CTFNDATA API client (upstream)
+# Upstream CTFNDATA API client (unchanged)
 # ---------------------------------------------------------------------------
-
-# Token cache for the upstream CTFNDATA API
 _api_token: str | None = None
 _api_token_expiry: float = 0.0
 
@@ -331,10 +168,8 @@ _api_token_expiry: float = 0.0
 def _get_api_token() -> str:
     """Authenticate against the upstream CTFNDATA API and cache the bearer token."""
     global _api_token, _api_token_expiry
-
     if _api_token and time.time() < _api_token_expiry - 60:
         return _api_token
-
     resp = httpx.post(
         f"{API_BASE}/login",
         json={"username": API_USER, "password": API_PASS},
@@ -343,15 +178,13 @@ def _get_api_token() -> str:
     resp.raise_for_status()
     data = resp.json()
     _api_token = data["access_token"]
-    expires_in = data.get("expires_in", 14400)
-    _api_token_expiry = time.time() + expires_in
+    _api_token_expiry = time.time() + data.get("expires_in", 14400)
     return _api_token
 
 
 def _api_get(path: str, params: dict | None = None) -> dict:
     """Make an authenticated GET request to the upstream CTFNDATA API."""
     global _api_token
-
     token = _get_api_token()
     resp = httpx.get(
         f"{API_BASE}{path}",
@@ -375,7 +208,6 @@ def _api_get(path: str, params: dict | None = None) -> dict:
 # ---------------------------------------------------------------------------
 # MCP Server & Tools
 # ---------------------------------------------------------------------------
-
 mcp = FastMCP(
     "ctfndata",
     instructions=(
@@ -389,7 +221,7 @@ mcp = FastMCP(
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
     ),
-        streamable_http_path="/",
+    streamable_http_path="/",
 )
 
 AVAILABLE_PARAMS = [
@@ -399,7 +231,6 @@ AVAILABLE_PARAMS = [
     "ann_date", "close_date", "currency", "deal_type", "deal_status",
     "consideration", "sector", "break_1w", "chance_1w", "updated",
 ]
-
 META_PARAMS = ["deal_count", "deals", "loaded", "params"]
 
 
@@ -415,7 +246,6 @@ def ctfndata_lookup(ticker: str, param: str) -> dict:
                gross_spread, gross_downside, downside_rt, premium,
                ann_date, close_date, currency, deal_type, deal_status,
                consideration, sector, break_1w, chance_1w, updated.
-
     Returns:
         Dict with the ticker, param name, and value.
     """
@@ -433,7 +263,6 @@ def ctfndata_all(ticker: str) -> dict:
 
     Args:
         ticker: Stock ticker symbol (e.g. "ROKU", "HIMS").
-
     Returns:
         Dict with all available metrics for the deal.
     """
@@ -452,7 +281,6 @@ def ctfndata_search(query: str, limit: int = 20) -> dict:
     Args:
         query: Search term (e.g. "Disney", "tech", "ROKU").
         limit: Maximum results to return. Default 20.
-
     Returns:
         Dict with matching deals and their key metrics.
     """
@@ -512,16 +340,10 @@ def ctfndata_health() -> dict:
 # ---------------------------------------------------------------------------
 # Entry point — composite Starlette app
 # ---------------------------------------------------------------------------
-
 if __name__ == "__main__":
     import uvicorn
 
-    # Initialize database on startup
-    _init_db()
-
     port = int(os.environ.get("PORT", 8080))
-
-    # Get the MCP ASGI app
     mcp_app = mcp.streamable_http_app()
 
     @asynccontextmanager
@@ -529,17 +351,20 @@ if __name__ == "__main__":
         async with mcp.session_manager.run():
             yield
 
-    # Build composite app: auth routes + JWT-protected MCP
     app = Starlette(
         routes=[
-            Route("/auth/login", login_endpoint, methods=["POST"]),
-            Route("/auth/register", register_endpoint, methods=["POST"]),
+            Route(
+                "/.well-known/oauth-protected-resource",
+                protected_resource_metadata,
+                methods=["GET"],
+            ),
             Route("/health", health_endpoint, methods=["GET"]),
             Mount("/mcp", app=mcp_app),
         ],
         middleware=[
-            Middleware(JWTAuthMiddleware),
+            Middleware(OAuthMiddleware),
         ],
         lifespan=lifespan,
     )
+
     uvicorn.run(app, host="0.0.0.0", port=port, proxy_headers=True, forwarded_allow_ips="*")
