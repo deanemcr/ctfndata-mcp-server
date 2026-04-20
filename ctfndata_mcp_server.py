@@ -582,8 +582,9 @@ def _get_api_token() -> str:
     )
     resp.raise_for_status()
     data = resp.json()
-    _api_token = data["access_token"]
-    _api_token_expiry = time.time() + data.get("expires_in", 14400)
+    # Upstream returns: {"status":"ok","token":"...","user":"...","expires_in_hours":24}
+    _api_token = data["token"]
+    _api_token_expiry = time.time() + data.get("expires_in_hours", 24) * 3600
     return _api_token
 
 
