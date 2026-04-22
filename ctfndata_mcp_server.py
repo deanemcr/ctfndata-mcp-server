@@ -617,12 +617,14 @@ def _api_get(path: str, params: dict | None = None) -> dict:
 mcp = FastMCP(
     "ctfndata",
     instructions=(
-        "CTFN Data connector — provides real-time M&A risk metrics from the "
-        "CTFNDATA platform. Query break prices, spreads, annualized spreads, "
-        "chance of close, risk/reward ratios, and more for active M&A deals. "
-        "Use ctfndata_lookup for a specific metric, ctfndata_all for a full "
-        "deal snapshot, ctfndata_search to find deals, and ctfndata_deals to "
-        "list all tracked deals."
+        "CTFN Data connector — real-time M&A deal metrics only. "
+        "Query break prices, spreads, annualized spreads, chance of close, "
+        "risk/reward, premium, and close-date estimates for active deals. "
+        "Use ctfndata_lookup for a single metric, ctfndata_all for a full "
+        "deal snapshot, ctfndata_search to find deals by name or keyword, "
+        "and ctfndata_deals to list all tracked deals. "
+        "This connector does NOT cover news, articles, or DMA content — "
+        "use the separate CTFN MCP for those."
     ),
     transport_security=TransportSecuritySettings(
         enable_dns_rebinding_protection=False,
@@ -709,36 +711,6 @@ def ctfndata_deals() -> dict:
         return _api_get("/api/ctfndata", params={"param": "deals"})
     except httpx.HTTPStatusError as e:
         return {"error": f"API error {e.response.status_code}: {e.response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def ctfndata_deal_count() -> dict:
-    """Get the total number of M&A deals currently tracked.
-
-    Returns:
-        Dict with the current deal count.
-    """
-    try:
-        return _api_get("/api/ctfndata", params={"param": "deal_count"})
-    except httpx.HTTPStatusError as e:
-        return {"error": f"API error {e.response.status_code}: {e.response.text}"}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-@mcp.tool()
-def ctfndata_health() -> dict:
-    """Check the health/status of the CTFNDATA backend API.
-
-    Returns:
-        Dict with status, deal count, and last update time.
-    """
-    try:
-        resp = httpx.get(f"{API_BASE}/health", timeout=10)
-        resp.raise_for_status()
-        return resp.json()
     except Exception as e:
         return {"error": str(e)}
 
